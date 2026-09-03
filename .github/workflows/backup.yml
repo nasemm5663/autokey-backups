@@ -1,0 +1,103 @@
+name: نسخة احتياطية يومية لقاعدة البيانات
+
+# يعمل يومياً الساعة 2:00 فجراً بتوقيت السعودية (23:00 UTC)
+on:
+  schedule:
+    - cron: '0 23 * * *'
+  workflow_dispatch:        # يسمح بالتشغيل اليدوي من زر في GitHub
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    # مطلوب: التوكن الافتراضي في المستودعات الجديدة للقراءة فقط،
+    # وبدون هذا السطر ستفشل خطوة حفظ النسخة بخطأ 403
+    permissions:
+      contents: write
+
+    steps:
+      - name: جلب المستودع
+        uses: actions/checkout@v4
+
+      - name: تثبيت أدوات Postgres 17
+        run: |
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+
+      - name: أخذ النسخة الاحتياطية
+        env:
+          # ⚠️ يجب أن يكون رابط "Session pooler" وليس "Direct connection".
+          # الاتصال المباشر يعمل على IPv6 فقط، وخوادم GitHub لا تدعمه،
+          # فتفشل النسخة بخطأ "Network is unreachable".
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p backups
+          STAMP=$(date -u +%Y-%m-%d)
+
+          # مخطط + بيانات، بدون المالكين والصلاحيات (تختلف بين المشاريع)
+          pg_dump "$DB_URL" \
+            --schema=public \
+            --no-owner \
+            --no-privileges \
+            --format=plain \
+            --file="backups/autokey_${STAMP}.sql"
+
+          gzip -f "backups/autokey_${STAMP}.sql"
+          ls -lh backups/
+
+      - name: التحقق من سلامة النسخة
+        run: |
+          set -euo pipefail
+          STAMP=$(date -u +%Y-%m-%d)
+          FILE="backups/autokey_${STAMP}.sql.gz"
+
+          # نسخة سليمة يجب أن تتجاوز 10 كيلوبايت وتحتوي جدول السيارات.
+          # بدون هذا الفحص قد نحفظ ملفاً فارغاً ونظنّ أننا محميون.
+          SIZE=$(stat -c%s "$FILE")
+          if [ "$SIZE" -lt 10240 ]; then
+            echo "::error::النسخة صغيرة بشكل مريب ($SIZE بايت) — يُرجّح أنها فشلت"
+            exit 1
+          fi
+
+          if ! gunzip -c "$FILE" | grep -q "cars_key_data"; then
+            echo "::error::النسخة لا تحتوي جدول cars_key_data"
+            exit 1
+          fi
+
+          ROWS=$(gunzip -c "$FILE" | grep -c "^INSERT INTO public.cars_key_data" || true)
+          echo "✔ النسخة سليمة — الحجم: $SIZE بايت"
+
+      - name: حذف النسخ الأقدم من 90 يوماً
+        run: |
+          # نعتمد على التاريخ في اسم الملف وليس على mtime،
+          # لأن git يعيد ضبط أوقات الملفات عند كل تنزيل فتبدو كلها جديدة
+          CUTOFF=$(date -u -d '90 days ago' +%Y-%m-%d)
+          for f in backups/autokey_*.sql.gz; do
+            [ -e "$f" ] || continue
+            D=$(basename "$f" | sed 's/autokey_\(.*\)\.sql\.gz/\1/')
+            if [[ "$D" < "$CUTOFF" ]]; then
+              rm -f "$f"; echo "حُذفت النسخة القديمة: $f"
+            fi
+          done
+
+      - name: حفظ النسخة في المستودع
+        run: |
+          git config user.name  "backup-bot"
+          git config user.email "backup-bot@users.noreply.github.com"
+          git add backups/
+          if git diff --staged --quiet; then
+            echo "لا تغييرات"
+          else
+            git commit -m "نسخة احتياطية تلقائية $(date -u +%Y-%m-%d)"
+            git push
+          fi
+
+      - name: نسخة إضافية كأرشيف قابل للتنزيل
+        uses: actions/upload-artifact@v4
+        with:
+          name: autokey-backup-${{ github.run_number }}
+          path: backups/*.sql.gz
+          retention-days: 90
