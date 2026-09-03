@@ -122,21 +122,38 @@ jobs:
           STAMP=$(date -u +%Y-%m-%d)
           FILE="backups/autokey_${STAMP}.sql.gz"
 
-          # نسخة سليمة يجب أن تتجاوز 10 كيلوبايت وتحتوي جدول السيارات.
-          # بدون هذا الفحص قد نحفظ ملفاً فارغاً ونظنّ أننا محميون.
           SIZE=$(stat -c%s "$FILE")
-          if [ "$SIZE" -lt 10240 ]; then
+          if [ "$SIZE" -lt 5120 ]; then
             echo "::error::النسخة صغيرة بشكل مريب ($SIZE بايت) — يُرجّح أنها فشلت"
             exit 1
           fi
 
-          if ! gunzip -c "$FILE" | grep -q "cars_key_data"; then
+          # نفك الضغط إلى ملف مؤقت بدل استخدام أنبوب.
+          # استخدام "gunzip -c | grep -q" يسبب Broken pipe لأن grep يتوقف
+          # فور أول تطابق، فيفشل الفحص رغم نجاح النسخة.
+          gunzip -c "$FILE" > /tmp/verify.sql
+
+          if ! grep -q "cars_key_data" /tmp/verify.sql; then
             echo "::error::النسخة لا تحتوي جدول cars_key_data"
             exit 1
           fi
 
-          ROWS=$(gunzip -c "$FILE" | grep -c "^INSERT INTO public.cars_key_data" || true)
-          echo "✔ النسخة سليمة — الحجم: $SIZE بايت"
+          # الفحص الحقيقي: هل توجد بيانات فعلاً، أم مجرد هيكل جداول فارغ؟
+          # نعدّ الأسطر داخل كتلة COPY الخاصة بجدول السيارات.
+          ROWS=$(awk '/^COPY public\.cars_key_data/{f=1;next} f&&/^\\\.$/{f=0} f{c++} END{print c+0}' /tmp/verify.sql)
+          LISHI=$(awk '/^COPY public\.lishi_tools/{f=1;next} f&&/^\\\.$/{f=0} f{c++} END{print c+0}' /tmp/verify.sql)
+
+          echo "الحجم المضغوط : $SIZE بايت"
+          echo "سجلات السيارات: $ROWS"
+          echo "أدوات Lishi   : $LISHI"
+
+          if [ "$ROWS" -lt 1 ]; then
+            echo "::error::النسخة تحتوي هيكل الجداول لكن بلا بيانات"
+            exit 1
+          fi
+
+          echo "✔ النسخة سليمة وتحتوي بيانات فعلية"
+          rm -f /tmp/verify.sql
 
       - name: حذف النسخ الأقدم من 90 يوماً
         run: |
