@@ -19,12 +19,11 @@ jobs:
       - name: جلب المستودع
         uses: actions/checkout@v4
 
-      - name: تثبيت أدوات Postgres 17
+      - name: إضافة مستودع Postgres الرسمي
         run: |
           sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
           sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql-client-17
 
       - name: فحص الاتصال قبل النسخ
         env:
@@ -60,6 +59,37 @@ jobs:
           fi
           echo "✔ الاتصال ناجح: $OUT"
 
+          # ---- مطابقة إصدار الأداة مع إصدار الخادم ----
+          # pg_dump ترفض العمل مع خادم أحدث منها. لذلك نكتشف إصدار خادمك
+          # ونجلب النسخة المطابقة، بدل تثبيت رقم ثابت قد يصبح قديماً.
+          SERVER_MAJOR=$(psql "$DB_URL" -tAc "show server_version" | cut -d. -f1 | tr -d '[:space:]')
+          echo "إصدار الخادم الرئيسي: $SERVER_MAJOR"
+
+          sudo apt-get install -y -qq "postgresql-client-${SERVER_MAJOR}" || true
+
+          # نستدعي الملف التنفيذي مباشرة، لا عبر الغلاف الذي قد يختار إصداراً أقدم
+          PGDUMP="/usr/lib/postgresql/${SERVER_MAJOR}/bin/pg_dump"
+          if [ ! -x "$PGDUMP" ]; then
+            PGDUMP=$(ls -d /usr/lib/postgresql/*/bin/pg_dump 2>/dev/null | sort -V | tail -1)
+          fi
+
+          if [ -z "${PGDUMP:-}" ] || [ ! -x "$PGDUMP" ]; then
+            echo "::error::لم يُعثر على pg_dump"
+            exit 1
+          fi
+
+          DUMP_MAJOR=$("$PGDUMP" --version | grep -oE '[0-9]+' | head -1)
+          echo "إصدار pg_dump: $DUMP_MAJOR  |  إصدار الخادم: $SERVER_MAJOR"
+
+          if [ "$DUMP_MAJOR" -lt "$SERVER_MAJOR" ]; then
+            echo "::error::pg_dump ($DUMP_MAJOR) أقدم من الخادم ($SERVER_MAJOR) وسيرفض العمل"
+            exit 1
+          fi
+          echo "✔ الإصداران متوافقان"
+
+          # نمرّر المسار للخطوة التالية
+          echo "PGDUMP=$PGDUMP" >> "$GITHUB_ENV"
+
       - name: أخذ النسخة الاحتياطية
         env:
           # ⚠️ يجب أن يكون رابط "Session pooler" وليس "Direct connection".
@@ -72,7 +102,7 @@ jobs:
           STAMP=$(date -u +%Y-%m-%d)
 
           # مخطط + بيانات، بدون المالكين والصلاحيات (تختلف بين المشاريع)
-          if ! pg_dump "$DB_URL" \
+          if ! "$PGDUMP" "$DB_URL" \
             --schema=public \
             --no-owner \
             --no-privileges \
