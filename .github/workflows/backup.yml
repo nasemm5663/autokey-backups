@@ -26,6 +26,40 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq postgresql-client-17
 
+      - name: فحص الاتصال قبل النسخ
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set +e
+          # لا نطبع الرابط أبداً حتى لا تتسرب كلمة المرور في السجل
+          if [ -z "${DB_URL:-}" ]; then
+            echo "::error::السرّ SUPABASE_DB_URL فارغ أو غير موجود"
+            exit 1
+          fi
+
+          # نتحقق من شكل الرابط بدون كشف محتواه
+          echo "$DB_URL" | grep -q "pooler.supabase.com" \
+            && echo "✔ الرابط يستخدم Session pooler (صحيح)" \
+            || echo "::warning::الرابط لا يبدو أنه Session pooler — قد يفشل بسبب IPv6"
+
+          echo "$DB_URL" | grep -q "postgres\." \
+            && echo "✔ اسم المستخدم بصيغة postgres.<معرّف-المشروع>" \
+            || echo "::error::اسم المستخدم يجب أن يكون postgres.<معرّف-المشروع> لا postgres وحده"
+
+          OUT=$(psql "$DB_URL" -tAc "select current_database()||' | '||current_user||' | '||split_part(version(),' ',2);" 2>&1)
+          CODE=$?
+          if [ $CODE -ne 0 ]; then
+            echo "::error::فشل الاتصال بقاعدة البيانات"
+            echo "$OUT"
+            echo ""
+            echo "الأسباب الشائعة:"
+            echo "  • Tenant or user not found  → المنطقة في الرابط خاطئة، أو اسم المستخدم ناقص معرّف المشروع"
+            echo "  • password authentication   → كلمة المرور خاطئة أو فيها رموز تحتاج ترميزاً"
+            echo "  • Network is unreachable    → استخدمت Direct connection بدل Session pooler"
+            exit 1
+          fi
+          echo "✔ الاتصال ناجح: $OUT"
+
       - name: أخذ النسخة الاحتياطية
         env:
           # ⚠️ يجب أن يكون رابط "Session pooler" وليس "Direct connection".
@@ -38,12 +72,16 @@ jobs:
           STAMP=$(date -u +%Y-%m-%d)
 
           # مخطط + بيانات، بدون المالكين والصلاحيات (تختلف بين المشاريع)
-          pg_dump "$DB_URL" \
+          if ! pg_dump "$DB_URL" \
             --schema=public \
             --no-owner \
             --no-privileges \
             --format=plain \
-            --file="backups/autokey_${STAMP}.sql"
+            --file="backups/autokey_${STAMP}.sql" 2> dump_err.txt; then
+            echo "::error::فشل pg_dump — نص الخطأ:"
+            cat dump_err.txt
+            exit 1
+          fi
 
           gzip -f "backups/autokey_${STAMP}.sql"
           ls -lh backups/
